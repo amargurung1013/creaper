@@ -83,6 +83,7 @@ class AWSProvider(BaseProvider):
     def clean(
         self,
         resources: list[ZombieResource],
+        older_than: timedelta | None = None,
         exclude_labels: list[str] | None = None,
     ) -> CleanupResult:
         """Safely delete resources after revalidating each one with AWS.

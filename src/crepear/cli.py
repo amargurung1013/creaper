@@ -232,7 +232,7 @@ def main(
     if isinstance(active_provider, AWSProvider):
         result = active_provider.clean(zombies, exclude_labels=exclude_label)
     else:
-        result = active_provider.clean(zombies)
+        result = active_provider.clean(zombies, older_than=retention, exclude_labels=exclude_label)
     payload["cleanup"] = {"deleted": result.deleted, "failed": result.failed}
     if json_output:
         typer.echo(json.dumps(payload, indent=2))

@@ -15,7 +15,7 @@ class FakeProvider:
     def audit(self, **kwargs):
         return self.resources
 
-    def clean(self, resources):
+    def clean(self, resources, **kwargs):
         return self.cleanup
 
 

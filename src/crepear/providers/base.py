@@ -16,5 +16,10 @@ class BaseProvider(ABC):
         """Find zombie resources without deleting anything."""
 
     @abstractmethod
-    def clean(self, resources: list[ZombieResource]) -> CleanupResult:
+    def clean(
+        self,
+        resources: list[ZombieResource],
+        older_than: timedelta | None = None,
+        exclude_labels: list[str] | None = None,
+    ) -> CleanupResult:
         """Delete the given resources and report succeeded and failed deletions."""
