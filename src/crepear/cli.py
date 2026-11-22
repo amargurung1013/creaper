@@ -2,14 +2,28 @@ import json
 from typing import Annotated
 
 import typer
+from botocore.exceptions import ClientError, NoCredentialsError
+from docker.errors import DockerException
 from rich.console import Console
 from rich.table import Table
 
 from crepear.models import ZombieResource, parse_duration
+from crepear.providers.aws_provider import AWSProvider
+from crepear.providers.base import BaseProvider
 from crepear.providers.docker_provider import DockerProvider
 
 app = typer.Typer(help="FinOps infrastructure auditing and zombie resource cleanup CLI.")
 console = Console()
+
+
+def get_provider(provider_name: str, region: str) -> BaseProvider:
+    """Factory function to instantiate the requested infrastructure provider."""
+    name = provider_name.strip().lower()
+    if name == "docker":
+        return DockerProvider()
+    if name == "aws":
+        return AWSProvider(region=region)
+    raise ValueError(f"Unsupported provider '{provider_name}'. Choose 'docker' or 'aws'.")
 
 
 def calculate_finops(zombies: list[ZombieResource], cost_per_gb_month: float) -> dict:
@@ -57,6 +71,14 @@ def render_table(zombies: list[ZombieResource], metrics: dict, dry_run: bool) ->
 
 @app.command()
 def main(
+    provider: Annotated[
+        str,
+        typer.Option("--provider", help="Infrastructure provider to audit ('docker' or 'aws')."),
+    ] = "docker",
+    region: Annotated[
+        str,
+        typer.Option("--region", help="AWS region (only used when --provider aws)."),
+    ] = "us-east-1",
     clean: Annotated[
         bool, typer.Option("--clean", help="Actually delete zombie resources.")
     ] = False,
@@ -73,7 +95,7 @@ def main(
         list[str] | None,
         typer.Option(
             "--exclude-label",
-            help="Exclude resources with this label (can be used multiple times).",
+            help="Exclude resources with this label/tag (can be used multiple times).",
         ),
     ] = None,
     cost_per_gb: Annotated[
@@ -94,16 +116,39 @@ def main(
             retention = parse_duration(older_than)
         except ValueError as e:
             console.print(f"[bold red]Error:[/bold red] {e}")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
 
-    # 2. Run the audit (read-only)
-    provider = DockerProvider()
-    zombies = provider.audit(older_than=retention, exclude_labels=exclude_label)
+    # 2. Initialize selected provider
+    try:
+        active_provider = get_provider(provider, region)
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+
+    # 3. Run the audit (read-only)
+    try:
+        zombies = active_provider.audit(older_than=retention, exclude_labels=exclude_label)
+    except NoCredentialsError:
+        console.print(
+            "[bold red]AWS Error:[/bold red] No credentials found. "
+            "Run `aws configure` or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
+        )
+        raise typer.Exit(code=1) from None
+    except ClientError as e:
+        console.print(f"[bold red]AWS API Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    except DockerException as e:
+        console.print(
+            f"[bold red]Docker Error:[/bold red] Could not connect to Docker daemon. ({e})"
+        )
+        raise typer.Exit(code=1) from None
+
     metrics = calculate_finops(zombies, cost_per_gb)
 
-    # 3. JSON output mode (for pipelines, cron, jq)
+    # 4. JSON output mode (for pipelines, cron, jq)
     if json_output:
         payload = {
+            "provider": provider,
             "dry_run": not clean,
             "metrics": metrics,
             "resources": [
@@ -118,12 +163,11 @@ def main(
                 for z in zombies
             ],
         }
-        # Use print() instead of console.print() so rich doesn't wrap lines or inject color codes
         print(json.dumps(payload, indent=2))
         if not clean or not zombies:
             return
 
-    # 4. Human-readable table mode
+    # 5. Human-readable table mode
     if not json_output:
         if not zombies:
             console.print(
@@ -132,7 +176,7 @@ def main(
             return
         render_table(zombies, metrics, dry_run=not clean)
 
-    # 5. Safe-by-default exit
+    # 6. Safe-by-default exit
     if not clean:
         if not json_output:
             console.print(
@@ -140,7 +184,7 @@ def main(
             )
         return
 
-    # 6. Destructive action with confirmation guardrail
+    # 7. Destructive action with confirmation guardrail
     if not force:
         confirmed = typer.confirm(
             f"Are you sure you want to permanently delete {len(zombies)} resource(s)?"
@@ -149,6 +193,6 @@ def main(
             console.print("[yellow]Aborted. Nothing was deleted.[/yellow]")
             raise typer.Exit(code=0)
 
-    deleted_ids = provider.clean(zombies)
+    deleted_ids = active_provider.clean(zombies)
     if not json_output:
         console.print(f"[bold green]Deleted {len(deleted_ids)} resource(s).[/bold green]")
