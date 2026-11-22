@@ -19,7 +19,13 @@ class ZombieResource:
     def size_mb(self) -> float:
         return round(self.size_bytes / (1024 * 1024), 2)
 
+@dataclass
+class CleanupResult:
+    """Tracks succeeded and failed deletions separately."""
 
+    deleted: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+    
 def parse_duration(duration_str: str) -> timedelta:
     """Parse strings like '7d', '24h', or '30m' into a timedelta."""
     match = re.fullmatch(r"(\d+)([dhm])", duration_str.strip().lower())

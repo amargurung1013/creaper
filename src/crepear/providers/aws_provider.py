@@ -1,27 +1,38 @@
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.exceptions import ClientError
 
-from crepear.models import ZombieResource
+from crepear.models import CleanupResult, ZombieResource
 from crepear.providers.base import BaseProvider
 
 DEFAULT_EXCLUDE_LABEL = "crepear.ignore=true"
+DEFAULT_REQUIRED_TAG = "crepear.eligible=true"
 
 
 class AWSProvider(BaseProvider):
-    def __init__(self, region: str = "us-east-1", client=None):
-        # Allow passing a mocked boto3 client in tests; default to real EC2 client.
+    def __init__(
+        self,
+        region: str = "us-east-1",
+        client=None,
+        required_tag: str | None = DEFAULT_REQUIRED_TAG,
+    ):
         self.client = client or boto3.client("ec2", region_name=region)
+        self.required_tag = required_tag
+
+    def _matches_rule(self, tags: dict[str, str], rule: str) -> bool:
+        if "=" in rule:
+            key, val = rule.split("=", 1)
+            return tags.get(key) == val
+        return rule in tags
 
     def _is_excluded(self, tags: dict[str, str], exclude_rules: list[str]) -> bool:
-        for rule in exclude_rules:
-            if "=" in rule:
-                key, val = rule.split("=", 1)
-                if tags.get(key) == val:
-                    return True
-            elif rule in tags:
-                return True
-        return False
+        return any(self._matches_rule(tags, rule) for rule in exclude_rules)
+
+    def _has_required_tag(self, tags: dict[str, str]) -> bool:
+        if not self.required_tag:
+            return True
+        return self._matches_rule(tags, self.required_tag)
 
     def _is_old_enough(self, created_at: datetime, older_than: timedelta | None) -> bool:
         if older_than is None:
@@ -37,41 +48,45 @@ class AWSProvider(BaseProvider):
         rules = [DEFAULT_EXCLUDE_LABEL] + (exclude_labels or [])
         zombies: list[ZombieResource] = []
 
-        # Only fetch "available" (unattached) EBS volumes—never touch "in-use" volumes.
-        response = self.client.describe_volumes(
-            Filters=[{"Name": "status", "Values": ["available"]}]
-        )
+        paginator = self.client.get_paginator("describe_volumes")
+        pages = paginator.paginate(Filters=[{"Name": "status", "Values": ["available"]}])
 
-        for vol in response.get("Volumes", []):
-            # AWS returns tags as [{"Key": "k", "Value": "v"}]; convert to a plain dict.
-            tags = {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
-            created_at = vol["CreateTime"]
+        for page in pages:
+            for vol in page.get("Volumes", []):
+                tags = {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
+                created_at = vol["CreateTime"]
 
-            if self._is_excluded(tags, rules) or not self._is_old_enough(created_at, older_than):
-                continue
+                if (
+                    not self._has_required_tag(tags)
+                    or self._is_excluded(tags, rules)
+                    or not self._is_old_enough(created_at, older_than)
+                ):
+                    continue
 
-            # AWS returns EBS size in GiB; convert to bytes to match ZombieResource.
-            size_bytes = vol["Size"] * 1024 * 1024 * 1024
-            vol_id = vol["VolumeId"]
+                size_bytes = vol["Size"] * 1024 * 1024 * 1024
+                vol_id = vol["VolumeId"]
 
-            zombies.append(
-                ZombieResource(
-                    id=vol_id,
-                    name=tags.get("Name", vol_id),
-                    resource_type="ebs_volume",
-                    size_bytes=size_bytes,
-                    created_at=created_at,
-                    provider="aws",
-                    labels=tags,
+                zombies.append(
+                    ZombieResource(
+                        id=vol_id,
+                        name=tags.get("Name", vol_id),
+                        resource_type="ebs_volume",
+                        size_bytes=size_bytes,
+                        created_at=created_at,
+                        provider="aws",
+                        labels=tags,
+                    )
                 )
-            )
 
         return zombies
 
-    def clean(self, resources: list[ZombieResource]) -> list[str]:
-        deleted_ids: list[str] = []
+    def clean(self, resources: list[ZombieResource]) -> CleanupResult:
+        result = CleanupResult()
         for res in resources:
             if res.resource_type == "ebs_volume":
-                self.client.delete_volume(VolumeId=res.id)
-                deleted_ids.append(res.id)
-        return deleted_ids
+                try:
+                    self.client.delete_volume(VolumeId=res.id)
+                    result.deleted.append(res.id)
+                except ClientError as e:
+                    result.failed[res.id] = str(e)
+        return result

@@ -193,6 +193,14 @@ def main(
             console.print("[yellow]Aborted. Nothing was deleted.[/yellow]")
             raise typer.Exit(code=0)
 
-    deleted_ids = active_provider.clean(zombies)
+    result = active_provider.clean(zombies)
     if not json_output:
-        console.print(f"[bold green]Deleted {len(deleted_ids)} resource(s).[/bold green]")
+        console.print(f"[bold green]Deleted {len(result.deleted)} resource(s).[/bold green]")
+        if result.failed:
+            console.print(
+                f"[bold red]Failed to delete {len(result.failed)} resource(s):[/bold red]"
+            )
+            for res_id, err in result.failed.items():
+                console.print(f"  - [cyan]{res_id}[/cyan]: {err}")
+    if result.failed:
+        raise typer.Exit(code=1)

@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
 import docker
+from docker.errors import DockerException
 
-from crepear.models import ZombieResource
+from crepear.models import CleanupResult, ZombieResource
 from crepear.providers.base import BaseProvider
 
 DEFAULT_EXCLUDE_LABEL = "crepear.ignore=true"
@@ -41,6 +42,13 @@ class DockerProvider(BaseProvider):
         cutoff = datetime.now(timezone.utc) - older_than
         return created_at <= cutoff
 
+    def _get_container_inactive_time(self, container) -> datetime:
+        """Return when the container actually exited, falling back to Created."""
+        finished_at = container.attrs.get("State", {}).get("FinishedAt")
+        if finished_at and not finished_at.startswith("0001-01-01"):
+            return self._parse_timestamp(finished_at)
+        return self._parse_timestamp(container.attrs["Created"])
+
     def audit(
         self,
         older_than: timedelta | None = None,
@@ -50,11 +58,14 @@ class DockerProvider(BaseProvider):
         zombies: list[ZombieResource] = []
 
         # 1. Stopped / Exited Containers
+        # 1. Stopped / Exited Containers
         for container in self.client.containers.list(all=True, filters={"status": "exited"}):
             labels = container.labels or {}
-            created_at = self._parse_timestamp(container.attrs["Created"])
+            inactive_since = self._get_container_inactive_time(container)
 
-            if self._is_excluded(labels, rules) or not self._is_old_enough(created_at, older_than):
+            if self._is_excluded(labels, rules) or not self._is_old_enough(
+                inactive_since, older_than
+            ):
                 continue
 
             zombies.append(
@@ -63,7 +74,7 @@ class DockerProvider(BaseProvider):
                     name=container.name,
                     resource_type="container",
                     size_bytes=container.attrs.get("SizeRw", 0),
-                    created_at=created_at,
+                    created_at=inactive_since,
                     provider="docker",
                     labels=labels,
                 )
@@ -91,13 +102,16 @@ class DockerProvider(BaseProvider):
 
         return zombies
 
-    def clean(self, resources: list[ZombieResource]) -> list[str]:
-        deleted_ids: list[str] = []
+    def clean(self, resources: list[ZombieResource]) -> CleanupResult:
+        result = CleanupResult()
         for res in resources:
-            if res.resource_type == "container":
-                self.client.containers.get(res.id).remove()
-                deleted_ids.append(res.id)
-            elif res.resource_type == "image":
-                self.client.images.remove(res.id)
-                deleted_ids.append(res.id)
-        return deleted_ids
+            try:
+                if res.resource_type == "container":
+                    self.client.containers.get(res.id).remove()
+                    result.deleted.append(res.id)
+                elif res.resource_type == "image":
+                    self.client.images.remove(res.id)
+                    result.deleted.append(res.id)
+            except DockerException as e:
+                result.failed[res.id] = str(e)
+        return result

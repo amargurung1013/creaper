@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from datetime import timedelta
 
-from crepear.models import ZombieResource
+from crepear.models import CleanupResult, ZombieResource
 
 
 class BaseProvider(ABC):
@@ -16,5 +16,5 @@ class BaseProvider(ABC):
         """Find zombie resources without deleting anything."""
 
     @abstractmethod
-    def clean(self, resources: list[ZombieResource]) -> list[str]:
-        """Delete the given resources and return a list of deleted IDs."""
+    def clean(self, resources: list[ZombieResource]) -> CleanupResult:
+        """Delete the given resources and report succeeded and failed deletions."""
