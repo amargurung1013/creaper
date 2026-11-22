@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from crepear.models import CleanupResult, ZombieResource
 from crepear.providers.base import BaseProvider
@@ -80,13 +80,54 @@ class AWSProvider(BaseProvider):
 
         return zombies
 
-    def clean(self, resources: list[ZombieResource]) -> CleanupResult:
+    def clean(
+        self,
+        resources: list[ZombieResource],
+        exclude_labels: list[str] | None = None,
+    ) -> CleanupResult:
+        """Safely delete resources after revalidating each one with AWS.
+
+        Audit results are observations, not authorization. Every volume is fetched
+        again because its state, tags, or existence may have changed since audit.
+        """
         result = CleanupResult()
+        exclusion_rules = [DEFAULT_EXCLUDE_LABEL] + (exclude_labels or [])
         for res in resources:
-            if res.resource_type == "ebs_volume":
-                try:
-                    self.client.delete_volume(VolumeId=res.id)
-                    result.deleted.append(res.id)
-                except ClientError as e:
-                    result.failed[res.id] = str(e)
+            if res.provider != "aws":
+                result.failed[res.id] = "resource does not belong to the AWS provider"
+                continue
+            if res.resource_type != "ebs_volume":
+                result.failed[res.id] = f"unsupported AWS resource type: {res.resource_type}"
+                continue
+
+            try:
+                response = self.client.describe_volumes(VolumeIds=[res.id])
+                volumes = response.get("Volumes", [])
+                if not volumes:
+                    result.failed[res.id] = "volume no longer exists"
+                    continue
+
+                volume = volumes[0]
+                tags = {
+                    tag["Key"]: tag["Value"]
+                    for tag in volume.get("Tags", [])
+                    if "Key" in tag and "Value" in tag
+                }
+                if volume.get("State") != "available":
+                    result.failed[res.id] = (
+                        f"volume is not available (current state: {volume.get('State', 'unknown')})"
+                    )
+                    continue
+                required_tag = self.required_tag or DEFAULT_REQUIRED_TAG
+                if not self._matches_rule(tags, required_tag):
+                    result.failed[res.id] = "volume is not eligible for deletion"
+                    continue
+                if self._is_excluded(tags, exclusion_rules):
+                    result.failed[res.id] = "volume has an exclusion tag"
+                    continue
+
+                self.client.delete_volume(VolumeId=res.id)
+                result.deleted.append(res.id)
+            except (ClientError, BotoCoreError) as e:
+                result.failed[res.id] = str(e)
         return result

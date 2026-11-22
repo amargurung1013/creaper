@@ -144,3 +144,60 @@ def test_clean_continues_on_individual_failure():
     assert result.deleted == ["img1"]
     assert "c1" in result.failed
     assert "container is in use" in result.failed["c1"]
+
+
+def test_container_zero_writable_layer_is_reported_as_estimate():
+    client = MagicMock()
+    client.containers.list.return_value = [_make_fake_container("c1", "empty", 10, size_rw=0)]
+    client.images.list.return_value = []
+    resource = DockerProvider(client=client).audit()[0]
+    assert resource.size_bytes == 0
+    assert resource.size_is_estimate is True
+    assert "writable layer" in resource.storage_note
+
+
+def test_shared_image_layers_are_not_counted_twice():
+    client = MagicMock()
+    first = _make_fake_image("img1", 10, size=100)
+    second = _make_fake_image("img2", 10, size=200)
+    first.attrs["RootFS"] = {"Layers": ["layer-a", "layer-shared"]}
+    second.attrs["RootFS"] = {"Layers": ["layer-shared", "layer-b"]}
+    client.containers.list.return_value = []
+    client.images.list.return_value = [first, second]
+    resources = DockerProvider(client=client).audit()
+    assert [resource.size_bytes for resource in resources] == [100, 0]
+    assert "shared" in resources[1].storage_note
+
+
+def test_unique_images_keep_approximate_sizes():
+    client = MagicMock()
+    first = _make_fake_image("img1", 10, size=100)
+    second = _make_fake_image("img2", 10, size=200)
+    first.attrs["RootFS"] = {"Layers": ["layer-a"]}
+    second.attrs["RootFS"] = {"Layers": ["layer-b"]}
+    client.containers.list.return_value = []
+    client.images.list.return_value = [first, second]
+    resources = DockerProvider(client=client).audit()
+    assert [resource.size_bytes for resource in resources] == [100, 200]
+
+
+def test_invalid_image_size_metadata_is_zero_and_explicit():
+    client = MagicMock()
+    image = _make_fake_image("img1", 10, size="unknown")
+    client.containers.list.return_value = []
+    client.images.list.return_value = [image]
+    resource = DockerProvider(client=client).audit()[0]
+    assert resource.size_bytes == 0
+    assert "missing or invalid" in resource.storage_note
+
+
+@pytest.mark.parametrize("price", [-1.0, float("nan"), float("inf"), float("-inf")])
+def test_calculate_finops_rejects_invalid_pricing(price):
+    with pytest.raises(ValueError):
+        calculate_finops([], price)
+
+
+def test_calculate_finops_accepts_zero_and_empty_resources():
+    metrics = calculate_finops([], 0.0)
+    assert metrics["total_gb"] == 0.0
+    assert metrics["est_monthly_savings_usd"] == 0.0

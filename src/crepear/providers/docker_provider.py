@@ -49,6 +49,27 @@ class DockerProvider(BaseProvider):
             return self._parse_timestamp(finished_at)
         return self._parse_timestamp(container.attrs["Created"])
 
+    def _image_size_estimate(self, image, seen_layers: set[str]) -> tuple[int, str]:
+        """Return a conservative image estimate and explain its limits.
+
+        Docker exposes virtual image size, not a generally reliable per-layer
+        reclaimable size. If layer identities are available, an image sharing
+        any layer with an earlier image is reported as zero incremental bytes
+        rather than double-counted.
+        """
+        raw_size = image.attrs.get("Size")
+        size = raw_size if isinstance(raw_size, int) and raw_size >= 0 else 0
+        rootfs = image.attrs.get("RootFS") or {}
+        layers = rootfs.get("Layers", [])
+        layer_ids = {layer for layer in layers if isinstance(layer, str)}
+        if layer_ids and layer_ids & seen_layers:
+            seen_layers.update(layer_ids)
+            return 0, "approximation: shared image layers were not counted twice"
+        seen_layers.update(layer_ids)
+        if not isinstance(raw_size, int) or raw_size < 0:
+            return 0, "approximation: Docker image size metadata was missing or invalid"
+        return size, "approximation: Docker image Size is virtual and may include shared layers"
+
     def audit(
         self,
         older_than: timedelta | None = None,
@@ -57,7 +78,6 @@ class DockerProvider(BaseProvider):
         rules = [DEFAULT_EXCLUDE_LABEL] + (exclude_labels or [])
         zombies: list[ZombieResource] = []
 
-        # 1. Stopped / Exited Containers
         # 1. Stopped / Exited Containers
         for container in self.client.containers.list(all=True, filters={"status": "exited"}):
             labels = container.labels or {}
@@ -73,14 +93,27 @@ class DockerProvider(BaseProvider):
                     id=container.short_id,
                     name=container.name,
                     resource_type="container",
-                    size_bytes=container.attrs.get("SizeRw", 0),
+                    size_bytes=(
+                        container.attrs.get("SizeRw", 0)
+                        if isinstance(container.attrs.get("SizeRw", 0), int)
+                        and container.attrs.get("SizeRw", 0) >= 0
+                        else 0
+                    ),
                     created_at=inactive_since,
                     provider="docker",
                     labels=labels,
+                    size_is_estimate=True,
+                    storage_note=(
+                        "Docker SizeRw is only the container writable layer, not total storage"
+                        if isinstance(container.attrs.get("SizeRw", 0), int)
+                        and container.attrs.get("SizeRw", 0) >= 0
+                        else "approximation: Docker SizeRw metadata was missing or invalid"
+                    ),
                 )
             )
 
         # 2. Dangling Images (<none>:<none>)
+        seen_layers: set[str] = set()
         for image in self.client.images.list(filters={"dangling": True}):
             labels = image.labels or {}
             created_at = self._parse_timestamp(image.attrs["Created"])
@@ -88,15 +121,18 @@ class DockerProvider(BaseProvider):
             if self._is_excluded(labels, rules) or not self._is_old_enough(created_at, older_than):
                 continue
 
+            size_bytes, storage_note = self._image_size_estimate(image, seen_layers)
             zombies.append(
                 ZombieResource(
                     id=image.short_id.replace("sha256:", ""),
                     name="<dangling>",
                     resource_type="image",
-                    size_bytes=image.attrs.get("Size", 0),
+                    size_bytes=size_bytes,
                     created_at=created_at,
                     provider="docker",
                     labels=labels,
+                    size_is_estimate=True,
+                    storage_note=storage_note,
                 )
             )
 

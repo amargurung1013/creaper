@@ -2,8 +2,10 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import boto3
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
+from crepear.models import ZombieResource
 from crepear.providers.aws_provider import AWSProvider
 
 
@@ -150,3 +152,81 @@ def test_aws_audit_paginates_multiple_pages():
 
     assert [z.id for z in zombies] == ["vol-page1", "vol-page2"]
     mock_client.get_paginator.assert_called_once_with("describe_volumes")
+
+
+def _resource(resource_type="ebs_volume", provider="aws", resource_id="vol-1"):
+    return ZombieResource(
+        resource_id,
+        resource_id,
+        resource_type,
+        1,
+        datetime.now(timezone.utc),
+        provider,
+    )
+
+
+def _aws_error(code="AccessDenied"):
+    return ClientError({"Error": {"Code": code, "Message": "test failure"}}, "DescribeVolumes")
+
+
+def test_aws_clean_revalidates_and_deletes_eligible_volume():
+    client = MagicMock()
+    client.describe_volumes.return_value = {
+        "Volumes": [
+            {
+                "VolumeId": "vol-1",
+                "State": "available",
+                "Tags": [{"Key": "crepear.eligible", "Value": "true"}],
+            }
+        ]
+    }
+    result = AWSProvider(client=client).clean([_resource()])
+    assert result.deleted == ["vol-1"]
+    assert result.failed == {}
+    client.delete_volume.assert_called_once_with(VolumeId="vol-1")
+
+
+def test_aws_clean_rejects_ineligible_attached_excluded_and_missing_volumes():
+    client = MagicMock()
+    responses = [
+        {"Volumes": [{"State": "available", "Tags": []}]},
+        {"Volumes": [{"State": "in-use", "Tags": [{"Key": "crepear.eligible", "Value": "true"}]}]},
+        {
+            "Volumes": [
+                {
+                    "State": "available",
+                    "Tags": [
+                        {"Key": "crepear.eligible", "Value": "true"},
+                        {"Key": "crepear.ignore", "Value": "true"},
+                    ],
+                }
+            ]
+        },
+        {"Volumes": []},
+    ]
+    client.describe_volumes.side_effect = responses
+    resources = [_resource(resource_id=f"vol-{i}") for i in range(4)]
+    result = AWSProvider(client=client).clean(resources)
+    assert result.deleted == []
+    assert set(result.failed) == {f"vol-{i}" for i in range(4)}
+    client.delete_volume.assert_not_called()
+
+
+def test_aws_clean_rejects_invalid_resource_and_provider():
+    client = MagicMock()
+    result = AWSProvider(client=client).clean(
+        [
+            _resource(resource_type="instance"),
+            _resource(provider="docker", resource_id="container-1"),
+        ]
+    )
+    assert set(result.failed) == {"vol-1", "container-1"}
+    client.describe_volumes.assert_not_called()
+
+
+def test_aws_clean_records_missing_and_api_failures_without_stopping():
+    client = MagicMock()
+    client.describe_volumes.side_effect = [_aws_error(), {"Volumes": []}]
+    result = AWSProvider(client=client).clean([_resource(), _resource(resource_id="vol-2")])
+    assert set(result.failed) == {"vol-1", "vol-2"}
+    assert "test failure" in result.failed["vol-1"]

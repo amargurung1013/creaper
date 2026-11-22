@@ -1,4 +1,5 @@
 import json
+import math
 from typing import Annotated
 
 import typer
@@ -26,16 +27,24 @@ def get_provider(provider_name: str, region: str) -> BaseProvider:
     raise ValueError(f"Unsupported provider '{provider_name}'. Choose 'docker' or 'aws'.")
 
 
-def calculate_finops(zombies: list[ZombieResource], cost_per_gb_month: float) -> dict:
+def calculate_finops(
+    zombies: list[ZombieResource], cost_per_gb_month: float, provider: str = "aws"
+) -> dict:
+    if not math.isfinite(cost_per_gb_month) or cost_per_gb_month < 0:
+        raise ValueError("cost per GB must be a finite, non-negative number")
     total_bytes = sum(z.size_bytes for z in zombies)
     total_mb = round(total_bytes / (1024 * 1024), 2)
     total_gb = round(total_bytes / (1024 * 1024 * 1024), 4)
-    est_monthly_savings = round(total_gb * cost_per_gb_month, 4)
+    est_monthly_savings = (
+        max(0.0, round(total_gb * cost_per_gb_month, 4)) if provider == "aws" else 0.0
+    )
     return {
         "count": len(zombies),
         "total_mb": total_mb,
         "total_gb": total_gb,
         "est_monthly_savings_usd": est_monthly_savings,
+        "savings_type": "aws_estimate" if provider == "aws" else "not_applicable",
+        "storage_estimate": any(z.size_is_estimate for z in zombies),
     }
 
 
@@ -63,9 +72,14 @@ def render_table(zombies: list[ZombieResource], metrics: dict, dry_run: bool) ->
         )
 
     console.print(table)
+    savings_label = (
+        "Estimated AWS Savings"
+        if any(z.provider == "aws" for z in zombies)
+        else "Docker Storage Only (no cloud savings calculated)"
+    )
     console.print(
         f"\n[bold]Reclaimable:[/bold] {metrics['total_mb']} MB ({metrics['total_gb']} GB) | "
-        f"[bold]Projected Cloud Savings:[/bold] ${metrics['est_monthly_savings_usd']}/mo"
+        f"[bold]{savings_label}:[/bold] ${metrics['est_monthly_savings_usd']}/mo"
     )
 
 
@@ -109,63 +123,85 @@ def main(
         bool, typer.Option("--json", help="Output raw JSON for CI/CD or scripts.")
     ] = False,
 ) -> None:
+    def error(message: str) -> None:
+        typer.echo(message, err=True)
+
+    if force and not clean:
+        error("Error: --force can only be used together with --clean.")
+        raise typer.Exit(code=2)
+
+    try:
+        metrics = calculate_finops([], cost_per_gb, provider=provider.strip().lower())
+    except ValueError as e:
+        error(f"Error: {e}")
+        raise typer.Exit(code=2) from None
+
     # 1. Validate --older-than flag
     retention = None
     if older_than:
         try:
             retention = parse_duration(older_than)
         except ValueError as e:
-            console.print(f"[bold red]Error:[/bold red] {e}")
+            error(f"Error: {e}")
             raise typer.Exit(code=1) from None
 
     # 2. Initialize selected provider
     try:
         active_provider = get_provider(provider, region)
     except ValueError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        error(f"Error: {e}")
         raise typer.Exit(code=1) from None
 
     # 3. Run the audit (read-only)
     try:
         zombies = active_provider.audit(older_than=retention, exclude_labels=exclude_label)
     except NoCredentialsError:
-        console.print(
-            "[bold red]AWS Error:[/bold red] No credentials found. "
+        error(
+            "AWS Error: No credentials found. "
             "Run `aws configure` or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
         )
         raise typer.Exit(code=1) from None
     except ClientError as e:
-        console.print(f"[bold red]AWS API Error:[/bold red] {e}")
+        error(f"AWS API Error: {e}")
         raise typer.Exit(code=1) from None
     except DockerException as e:
-        console.print(
-            f"[bold red]Docker Error:[/bold red] Could not connect to Docker daemon. ({e})"
-        )
+        error(f"Docker Error: Could not connect to Docker daemon. ({e})")
         raise typer.Exit(code=1) from None
 
-    metrics = calculate_finops(zombies, cost_per_gb)
+    metrics = calculate_finops(zombies, cost_per_gb, provider=provider.strip().lower())
 
-    # 4. JSON output mode (for pipelines, cron, jq)
-    if json_output:
-        payload = {
-            "provider": provider,
-            "dry_run": not clean,
-            "metrics": metrics,
-            "resources": [
-                {
-                    "id": z.id,
-                    "name": z.name,
-                    "type": z.resource_type,
-                    "size_mb": z.size_mb,
-                    "created_at": z.created_at.isoformat(),
-                    "provider": z.provider,
-                }
-                for z in zombies
-            ],
-        }
-        print(json.dumps(payload, indent=2))
-        if not clean or not zombies:
-            return
+    payload = {
+        "provider": provider.strip().lower(),
+        "dry_run": not clean,
+        "metrics": metrics,
+        "resources": [
+            {
+                "id": z.id,
+                "name": z.name,
+                "type": z.resource_type,
+                "size_mb": z.size_mb,
+                "created_at": z.created_at.isoformat(),
+                "provider": z.provider,
+                "labels": z.labels,
+                "size_is_estimate": z.size_is_estimate,
+                "storage_note": z.storage_note,
+            }
+            for z in zombies
+        ],
+        "cleanup": {"deleted": [], "failed": {}},
+    }
+
+    # JSON output must be one complete document and must never prompt.
+    if json_output and clean and not force:
+        payload["cleanup"]["failed"]["__authorization__"] = (
+            "--clean with --json requires --force; no resources were deleted"
+        )
+        typer.echo(json.dumps(payload, indent=2))
+        raise typer.Exit(code=1)
+
+    if json_output and (not clean or not zombies):
+        typer.echo(json.dumps(payload, indent=2))
+        return
 
     # 5. Human-readable table mode
     if not json_output:
@@ -193,7 +229,16 @@ def main(
             console.print("[yellow]Aborted. Nothing was deleted.[/yellow]")
             raise typer.Exit(code=0)
 
-    result = active_provider.clean(zombies)
+    if isinstance(active_provider, AWSProvider):
+        result = active_provider.clean(zombies, exclude_labels=exclude_label)
+    else:
+        result = active_provider.clean(zombies)
+    payload["cleanup"] = {"deleted": result.deleted, "failed": result.failed}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        if result.failed:
+            raise typer.Exit(code=1)
+        return
     if not json_output:
         console.print(f"[bold green]Deleted {len(result.deleted)} resource(s).[/bold green]")
         if result.failed:
